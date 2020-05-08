@@ -25,21 +25,30 @@ import (
 func BulkInsert(db *gorm.DB, objects []interface{}, chunkSize int, excludeColumns ...string) error {
 	// Split records with specified size not to exceed Database parameter limit
 	for _, objSet := range splitObjects(objects, chunkSize) {
-		if err := insertObjSet(db, objSet, excludeColumns...); err != nil {
+		if _, err := insertObjSet(db, false, objSet, excludeColumns...); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func insertObjSet(db *gorm.DB, objects []interface{}, excludeColumns ...string) error {
+func BulkInsertIgnore(db *gorm.DB, objects []interface{}, chunkSize int, excludeColumns ...string) (rows_affected int64, err error) {
+	for _, objSet := range splitObjects(objects, chunkSize) {
+		if rows, err := insertObjSet(db, true, objSet, excludeColumns...); err == nil {
+			rows_affected += rows
+		}
+	}
+	return
+}
+
+func insertObjSet(db *gorm.DB, ignore bool, objects []interface{}, excludeColumns ...string) (rows_affected int64, err error) {
 	if len(objects) == 0 {
-		return nil
+		return
 	}
 
 	firstAttrs, err := extractMapValue(objects[0], excludeColumns)
 	if err != nil {
-		return err
+		return
 	}
 
 	attrSize := len(firstAttrs)
@@ -58,12 +67,13 @@ func insertObjSet(db *gorm.DB, objects []interface{}, excludeColumns ...string) 
 	for _, obj := range objects {
 		objAttrs, err := extractMapValue(obj, excludeColumns)
 		if err != nil {
-			return err
+			return 0, err
 		}
 
 		// If object sizes are different, SQL statement loses consistency
 		if len(objAttrs) != attrSize {
-			return errors.New("attribute sizes are inconsistent")
+			err = errors.New("attribute sizes are inconsistent")
+			return 0, err
 		}
 
 		scope := db.NewScope(obj)
@@ -86,19 +96,28 @@ func insertObjSet(db *gorm.DB, objects []interface{}, excludeColumns ...string) 
 	if val, ok := db.Get("gorm:insert_option"); ok {
 		strVal, ok := val.(string)
 		if !ok {
-			return errors.New("gorm:insert_option should be a string")
+			return 0, errors.New("gorm:insert_option should be a string")
 		}
 		insertOption = strVal
 	}
+	strignore := ""
+	switch db.Dialect().GetName() {
+	case "mysql":
+		strignore = "IGNORE"
+	case "postgres":
+		insertOption += " ON CONFLICT IGNORE"
+	}
 
-	mainScope.Raw(fmt.Sprintf("INSERT INTO %s (%s) VALUES %s %s",
+	mainScope.Raw(fmt.Sprintf("INSERT %s INTO %s (%s) VALUES %s %s",
+		strignore,
 		mainScope.QuotedTableName(),
 		strings.Join(dbColumns, ", "),
 		strings.Join(placeholders, ", "),
 		insertOption,
 	))
 
-	return db.Exec(mainScope.SQL, mainScope.SQLVars...).Error
+	result := db.Exec(mainScope.SQL, mainScope.SQLVars...)
+	return result.RowsAffected, result.Error
 }
 
 // Obtain columns and values required for insert from interface
